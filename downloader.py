@@ -1,30 +1,60 @@
-import sys
-import requests
-import os
+import aiohttp
+import aiofiles
+import asyncio
+import time
 from pathlib import Path
-import json
-import song_grabber
+from song_grabber import get_songs
 
-songs = song_grabber.getSongs()
-songsPath = "Songs"
-previewPaths = "Previews"
+CHUNK_SIZE = 1024 * 1024 # 1 MB
 
-# i = 0
-# while i < len(songs):
-#     newlist = [songs[i].strip().split(" - ")[1],songs[i].strip().split(" - ")[0],songs[i+1].strip(),songs[i+2].strip()]
-#     songs.append(newlist)
-#     i += 4
+async def get_file(session, url, directory, name, sem):
+    async with sem:
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    Path(directory).parents[0].mkdir(
+                        parents=True, exist_ok=True)
+                    async with aiofiles.open(directory, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                            await f.write(chunk)
+                    print(f'Downloaded {directory}.')
+                else:
+                    print(f"not success, code is {resp.status}")
+        except asyncio.exceptions.TimeoutError as e:
+            print(f"Timed out while getting file {name}.")
+        except Exception as e:
+            print(f"An error occurred while getting {name}: {e}")
+
+async def verify_file(directory):
+    if Path(directory).exists():
+        return True
+    return False
 
 
-for song in songs:
-    songFolder = Path(f"{songsPath}/{song[0]}")
-    songFolder.mkdir(exist_ok=True,parents=True)
-    if os.path.exists(songFolder / Path(song[0]+".m4a")):
-        print(f"File {song[1]} exists. Skipping...")
-        continue
-    songPath = songFolder / Path(song[1]+".m4a")
-    f = songPath.open("wb")
-    print(f"Downloading {song[1]}...")
-    request = requests.get(song[2].replace("Song: ",""))
-    f.write(request.content)
-    f.close()
+async def get_files_to_dl(session, items, out_dir):
+    sem = asyncio.Semaphore(15) # downloads 15 files at once
+    tasks = [asyncio.ensure_future(get_file(session, item[2], f"{out_dir}/{item[0]} - {item[1]}.m4a", f'{item[0]} - {item[1]}.m4a', sem))
+             for item in items
+             if not await verify_file(f"{out_dir}/{item[0]} - {item[1]}.m4a")]
+    return tasks
+
+
+async def download_files(items, out_dir):
+    timeout = aiohttp.ClientTimeout(total=None)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for _ in range(10):  # verify up to 10 times that the files are valid
+            tasks = await get_files_to_dl(session, items, out_dir)
+            if len(tasks) == 0:
+                print("All files valid!")
+                break
+            await asyncio.gather(*tasks)
+    
+
+async def main():
+    start_time = time.time()
+    song_list = await get_songs()
+    await download_files(song_list, "download")
+    print(f"--- {(time.time() - start_time)} seconds to download ---")
+
+if __name__ == "__main__":
+    asyncio.run(main())
